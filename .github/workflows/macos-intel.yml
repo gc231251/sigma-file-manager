@@ -28,6 +28,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - name: Test mount discovery
+        run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml --target x86_64-apple-darwin --lib dir_reader::drives_platform::tests
       - name: Build Intel app and DMG
         run: bash scripts/build-macos-intel.sh "$GITHUB_WORKSPACE"
       - name: Verify Intel architecture and deployment target

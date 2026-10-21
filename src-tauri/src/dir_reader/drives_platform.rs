@@ -5,11 +5,6 @@
 #[cfg(any(target_os = "macos", windows))]
 use crate::utils::normalize_path;
 
-#[cfg(target_os = "macos")]
-use std::fs;
-#[cfg(target_os = "macos")]
-use std::path::Path;
-
 #[cfg(any(target_os = "macos", windows))]
 use super::types::DriveInfo;
 
@@ -106,53 +101,76 @@ pub(super) fn should_skip_macos_mount(mount_point: &str) -> bool {
     false
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn is_macos_network_volume(file_system: &str, mount_point: &str) -> bool {
+    mount_point.starts_with("/Volumes/")
+        && matches!(
+            file_system,
+            "smbfs" | "afpfs" | "nfs" | "nfs4" | "cifs" | "webdav" | "sshfs" | "fuse.sshfs"
+        )
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn append_macos_network_volumes(
     drives: &mut Vec<DriveInfo>,
     seen_paths: &mut std::collections::HashSet<String>,
 ) {
-    let volumes_dir = Path::new("/Volumes");
-    let entries = match fs::read_dir(volumes_dir) {
-        Ok(entries) => entries,
+    use std::ffi::CStr;
+
+    // SAFETY: a null buffer with size zero asks only for the mount count.
+    // MNT_NOWAIT avoids contacting unresponsive network servers.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count <= 0 {
+        return;
+    }
+
+    // Leave room for volumes mounted between the two calls. Use owned storage
+    // rather than getmntinfo's process-global buffer, which can race refreshes.
+    let capacity = count as usize + 16;
+    // SAFETY: statfs consists of integer fields and character arrays.
+    let mut mounts: Vec<libc::statfs> = vec![unsafe { std::mem::zeroed() }; capacity];
+    let buffer_size = match i32::try_from(capacity * std::mem::size_of::<libc::statfs>()) {
+        Ok(size) => size,
         Err(_) => return,
     };
+    // SAFETY: mounts is writable and buffer_size describes its allocated size.
+    let count = unsafe { libc::getfsstat(mounts.as_mut_ptr(), buffer_size, libc::MNT_NOWAIT) };
+    if count <= 0 {
+        return;
+    }
+    mounts.truncate((count as usize).min(capacity));
+    for mount in mounts {
+        // SAFETY: statfs mount and filesystem names are NUL-terminated by macOS.
+        let mount_point = unsafe { CStr::from_ptr(mount.f_mntonname.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let file_system = unsafe { CStr::from_ptr(mount.f_fstypename.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
 
-    for entry in entries.flatten() {
-        let mount_point = entry.path().to_string_lossy().to_string();
+        // Directory entries in /Volumes can be stale folders or symlinks to
+        // local disks. Only actual mounted network filesystems belong here.
+        if !is_macos_network_volume(&file_system, &mount_point) {
+            continue;
+        }
+
         let path = normalize_path(&mount_point);
-
-        if seen_paths.contains(&path) {
+        if !seen_paths.insert(path.clone()) {
             continue;
         }
-
-        if !entry.path().is_dir() {
-            continue;
-        }
-
-        let metadata = match fs::metadata(&entry.path()) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-
-        if metadata.len() == 0 && !metadata.is_dir() {
-            continue;
-        }
-
-        let display_name = entry.file_name().to_string_lossy().to_string();
-        seen_paths.insert(path.clone());
 
         drives.push(DriveInfo {
-            name: display_name,
+            name: mount_point_last_component(&mount_point),
             path,
             mount_point,
-            file_system: "Network".to_string(),
+            file_system,
             drive_type: "Network".to_string(),
             total_space: 0,
             available_space: 0,
             used_space: 0,
             percent_used: 0.0,
             is_removable: false,
-            is_read_only: false,
+            is_read_only: mount.f_flags & libc::MNT_RDONLY as u32 != 0,
             is_mounted: true,
             device_path: String::new(),
         });
@@ -449,6 +467,27 @@ pub(super) fn mount_point_last_component(mount_point: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_network_volumes_keep_mounted_shares() {
+        assert!(is_macos_network_volume("smbfs", "/Volumes/Team Share"));
+        assert!(is_macos_network_volume("nfs", "/Volumes/Server"));
+        assert!(is_macos_network_volume("afpfs", "/Volumes/Backup"));
+    }
+
+    #[test]
+    fn macos_network_volumes_exclude_local_disks_and_disk_images() {
+        assert!(!is_macos_network_volume("apfs", "/Volumes/Mac OS - 数据"));
+        assert!(!is_macos_network_volume("hfs", "/Volumes/Sigma File Manager"));
+        assert!(!is_macos_network_volume("ntfs", "/Volumes/[C] Windows 11.hidden"));
+    }
+
+    #[test]
+    fn macos_network_volumes_exclude_system_paths() {
+        assert!(!is_macos_network_volume("smbfs", "/"));
+        assert!(!is_macos_network_volume("smbfs", "/System/Volumes/Data"));
+        assert!(!is_macos_network_volume("smbfs", "/Volumes-old/Share"));
+    }
 
     #[test]
     fn linux_mount_filter_keeps_root_filesystem() {
