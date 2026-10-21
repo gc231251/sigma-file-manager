@@ -1,0 +1,50 @@
+name: macOS 12 Intel client
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'build/macos-intel-*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      CARGO_BUILD_JOBS: '3'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.16.0'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Build Intel app and DMG
+        run: bash scripts/build-macos-intel.sh "$GITHUB_WORKSPACE"
+      - name: Verify Intel architecture and deployment target
+        shell: bash
+        run: |
+          set -euo pipefail
+          app='src-tauri/target/x86_64-apple-darwin/release/bundle/macos/Sigma File Manager.app'
+          binary="$app/Contents/MacOS/sigma-file-manager"
+          test "$(lipo -archs "$binary")" = x86_64
+          /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist"
+          xcrun vtool -show-build "$binary"
+          ditto -c -k --sequesterRsrc --keepParent "$app" sigma-file-manager-macos12-intel.app.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sigma-file-manager-macos12-intel
+          path: |
+            src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+            sigma-file-manager-macos12-intel.app.zip
+          if-no-files-found: error
+          retention-days: 14
